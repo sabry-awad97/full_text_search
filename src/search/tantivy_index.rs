@@ -3,11 +3,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tantivy::TantivyDocument;
 use tantivy::{
     collector::TopDocs,
     query::QueryParser,
     schema::{Field, Schema, STORED, TEXT},
-    Document, Index, IndexWriter,
+    Index, IndexWriter,
 };
 use tempfile::TempDir;
 
@@ -50,8 +51,8 @@ impl TantivyIndex {
         })
     }
 
-    fn create_document(&self, title: &str, body: &str) -> Document {
-        let mut doc = Document::new();
+    fn create_document(&self, title: &str, body: &str) -> TantivyDocument {
+        let mut doc = TantivyDocument::new();
         doc.add_text(self.title_field, title);
         doc.add_text(self.body_field, body);
         doc

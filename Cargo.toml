@@ -11,11 +11,12 @@ dotenvy = "0.15"
 futures = "0.3.28"
 serde = { version = "1.0.188", features = ["derive"] }
 serde_json = "1.0.107"
-sea-orm = { version = "0.12", features = ["sqlx-postgres", "runtime-tokio-native-tls", "macros"] }
-tantivy = "0.19"
+sea-orm = { version = "1.1.1", features = [
+    "sqlx-postgres",
+    "runtime-tokio-native-tls",
+    "macros",
+] }
+tantivy = "0.22.0"
 tempfile = "3.8.0"
 tokio = { version = "1.32.0", features = ["full"] }
 tokio-stream = { version = "0.1.14", features = ["sync"] }
-
-[dev-dependencies]
-tokio-test = "0.4"
