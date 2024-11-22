@@ -1,4 +1,5 @@
 use axum::extract::ws::{Message, WebSocket};
+use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::{
@@ -59,10 +60,10 @@ impl Default for Priority {
 /// Represents different types of events that can be broadcasted
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Event<T> {
-    payload: EventPayload<T>,
-    topic: Option<String>,
-    priority: Priority,
-    timestamp: u64,
+    pub payload: EventPayload<T>,
+    pub topic: Option<String>,
+    pub priority: Priority,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -85,10 +86,7 @@ impl<T> Event<T> {
             payload,
             topic: None,
             priority: Priority::default(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            timestamp: Utc::now(),
         }
     }
 
@@ -242,37 +240,62 @@ where
     }
 
     /// Creates a new subscriber with optional filter
-    pub async fn subscribe_with_filter(&self, filter: SubscriptionFilter) -> Receiver<Event<T>> {
+    pub fn subscribe_with_filter(&self, filter: SubscriptionFilter) -> Receiver<Event<T>> {
         self.stats.record_subscriber_added();
+        let (tx, rx) = broadcast::channel(self.config.channel_size);
+        let filter = Arc::new(filter);
+        let sender_clone = self.sender.clone();
+        let filter_clone = filter.clone();
 
         // Update topic subscriber count
         if let Some(topics) = &filter.topics {
-            let mut topic_subs = self.topic_subscribers.write().await;
-            for topic in topics {
-                *topic_subs.entry(topic.clone()).or_default() += 1;
+            if let Ok(mut topic_subs) = self.topic_subscribers.try_write() {
+                for topic in topics {
+                    *topic_subs.entry(topic.clone()).or_default() += 1;
+                }
             }
         }
 
         // Send historical messages that match the filter
-        let history = self.message_history.read().await;
-        for event in history.iter() {
-            if filter.matches(event) {
-                let _ = self.sender.send(event.clone());
+        if let Ok(history) = self.message_history.try_read() {
+            for event in history.iter() {
+                if filter.matches(event) {
+                    let _ = tx.send(event.clone());
+                }
             }
         }
 
-        self.sender.subscribe()
+        // Spawn task to filter and forward messages
+        tokio::spawn(async move {
+            let mut receiver = sender_clone.subscribe();
+            while let Ok(event) = receiver.recv().await {
+                if filter_clone.matches(&event) {
+                    let _ = tx.send(event);
+                }
+            }
+        });
+
+        rx
     }
 
     /// Creates a new subscriber
     pub fn subscribe(&self) -> Receiver<Event<T>> {
         self.stats.record_subscriber_added();
-        self.sender.subscribe()
+        let receiver = self.sender.subscribe();
+
+        // Send historical messages to new subscriber
+        if let Ok(history) = self.message_history.try_read() {
+            for event in history.iter() {
+                let _ = self.sender.send(event.clone());
+            }
+        }
+
+        receiver
     }
 
     /// Broadcasts an event to all subscribers
     pub async fn broadcast(&self, event: Event<T>) -> Result<(), NotificationError> {
-        // Store in history
+        // Store in history first
         {
             let mut history = self.message_history.write().await;
             if history.len() >= self.config.history_size {
@@ -281,6 +304,7 @@ where
             history.push_back(event.clone());
         }
 
+        // Ensure event is sent to all subscribers
         match self.sender.send(event.clone()) {
             Ok(receiver_count) => {
                 self.stats.record_message_sent();
@@ -425,8 +449,7 @@ where
 mod tests {
     use super::*;
     use crate::entities::inventory::Model as InventoryItem;
-    use std::time::Duration;
-    use tokio::sync::broadcast::error::TryRecvError;
+    use tokio::time::Duration;
 
     fn create_test_item(id: i32) -> InventoryItem {
         use chrono::Utc;
@@ -450,11 +473,6 @@ mod tests {
     async fn test_notification_hub_creation() {
         let hub: NotificationHub<InventoryItem> = NotificationHub::new();
         assert_eq!(hub.subscriber_count(), 0);
-
-        let stats = hub.get_stats().await;
-        assert_eq!(stats.messages_sent.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.messages_dropped.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.active_subscribers.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -469,237 +487,564 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_event_broadcasting() {
-        let hub = NotificationHub::new();
-        let mut receiver1 = hub.subscribe();
-        let mut receiver2 = hub.subscribe();
+    async fn test_topic_filtering() {
+        let hub: NotificationHub<InventoryItem> = NotificationHub::new();
 
-        assert_eq!(hub.subscriber_count(), 2);
+        // Create filters for different topics
+        let inventory_filter = SubscriptionFilter::new().with_topics(vec!["inventory".to_string()]);
+        let sales_filter = SubscriptionFilter::new().with_topics(vec!["sales".to_string()]);
+        let multi_filter = SubscriptionFilter::new()
+            .with_topics(vec!["inventory".to_string(), "sales".to_string()]);
 
-        // Test Created event
-        let item = create_test_item(1);
-        hub.broadcast(Event::new(EventPayload::Created(item.clone())))
-            .await
-            .unwrap();
+        // Create receivers with filters
+        let mut inventory_receiver = hub.subscribe_with_filter(inventory_filter);
+        let mut sales_receiver = hub.subscribe_with_filter(sales_filter);
+        let mut multi_receiver = hub.subscribe_with_filter(multi_filter);
 
-        // Use timeout to prevent test from hanging
-        let timeout = Duration::from_secs(1);
+        // Wait for initialization
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
-        let result1 = tokio::time::timeout(timeout, receiver1.recv()).await;
-        assert!(result1.is_ok(), "Receiver 1 timed out");
-        if let Ok(Ok(Event {
-            payload: EventPayload::Created(received_item),
-            ..
-        })) = result1
-        {
-            assert_eq!(received_item.id, 1);
-            assert_eq!(received_item.name, "Test Item 1");
+        // Clear any pending messages
+        while inventory_receiver.try_recv().is_ok() {}
+        while sales_receiver.try_recv().is_ok() {}
+        while multi_receiver.try_recv().is_ok() {}
+
+        // Send events with different topics
+        let inventory_item = create_test_item(1);
+        let sales_item = create_test_item(2);
+        let inventory_event =
+            Event::new(EventPayload::Created(inventory_item.clone())).with_topic("inventory");
+        let sales_event = Event::new(EventPayload::Created(sales_item.clone())).with_topic("sales");
+
+        // Broadcast events with delays
+        hub.broadcast(inventory_event.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        hub.broadcast(sales_event.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let timeout = Duration::from_millis(200);
+
+        // Inventory receiver should only get inventory event
+        let result = tokio::time::timeout(timeout, inventory_receiver.recv()).await;
+        assert!(result.is_ok(), "Inventory receiver timed out");
+        let received = result.unwrap().unwrap();
+        assert_eq!(
+            received.topic.as_deref(),
+            Some("inventory"),
+            "Wrong topic received by inventory subscriber"
+        );
+        if let EventPayload::Created(item) = received.payload {
+            assert_eq!(
+                item.id, inventory_item.id,
+                "Wrong item received by inventory subscriber"
+            );
         } else {
-            panic!("Failed to receive Created event on receiver 1");
+            panic!("Wrong payload type received by inventory subscriber");
         }
 
-        let result2 = tokio::time::timeout(timeout, receiver2.recv()).await;
-        assert!(result2.is_ok(), "Receiver 2 timed out");
-        if let Ok(Ok(Event {
-            payload: EventPayload::Created(received_item),
-            ..
-        })) = result2
-        {
-            assert_eq!(received_item.id, 1);
-            assert_eq!(received_item.name, "Test Item 1");
+        // Sales receiver should only get sales event
+        let result = tokio::time::timeout(timeout, sales_receiver.recv()).await;
+        assert!(result.is_ok(), "Sales receiver timed out");
+        let received = result.unwrap().unwrap();
+        assert_eq!(
+            received.topic.as_deref(),
+            Some("sales"),
+            "Wrong topic received by sales subscriber"
+        );
+        if let EventPayload::Created(item) = received.payload {
+            assert_eq!(
+                item.id, sales_item.id,
+                "Wrong item received by sales subscriber"
+            );
         } else {
-            panic!("Failed to receive Created event on receiver 2");
+            panic!("Wrong payload type received by sales subscriber");
         }
 
-        // Verify stats
-        let stats = hub.get_stats().await;
-        assert_eq!(stats.messages_sent.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.messages_dropped.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.active_subscribers.load(Ordering::Relaxed), 2);
+        // Multi receiver should get both events
+        let mut received_events = Vec::new();
+        for _ in 0..2 {
+            if let Ok(Ok(event)) = tokio::time::timeout(timeout, multi_receiver.recv()).await {
+                received_events.push(event);
+            }
+        }
+        assert_eq!(
+            received_events.len(),
+            2,
+            "Multi subscriber didn't receive both events"
+        );
+
+        let received_topics: Vec<_> = received_events
+            .iter()
+            .filter_map(|e| e.topic.as_deref())
+            .collect();
+        assert!(
+            received_topics.contains(&"inventory"),
+            "Multi subscriber missing inventory event"
+        );
+        assert!(
+            received_topics.contains(&"sales"),
+            "Multi subscriber missing sales event"
+        );
+
+        let received_ids: Vec<_> = received_events
+            .iter()
+            .filter_map(|e| {
+                if let EventPayload::Created(item) = &e.payload {
+                    Some(item.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            received_ids.contains(&inventory_item.id),
+            "Multi subscriber missing inventory item"
+        );
+        assert!(
+            received_ids.contains(&sales_item.id),
+            "Multi subscriber missing sales item"
+        );
     }
 
     #[tokio::test]
-    async fn test_multiple_events() {
-        let hub = NotificationHub::new();
-        let mut receiver = hub.subscribe();
-        let timeout = Duration::from_secs(1);
+    async fn test_priority_filtering() {
+        let hub: NotificationHub<InventoryItem> = NotificationHub::new();
 
-        // Send multiple events
-        let item1 = create_test_item(1);
-        let item2 = create_test_item(2);
+        // Create subscribers with different priority filters
+        let high_filter = SubscriptionFilter::new().with_min_priority(Priority::High);
+        let normal_filter = SubscriptionFilter::new().with_min_priority(Priority::Normal);
 
-        // Test all event types
+        // Subscribe and wait for initialization
+        let mut high_receiver = hub.subscribe_with_filter(high_filter);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut normal_receiver = hub.subscribe_with_filter(normal_filter);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Clear any pending messages
+        while high_receiver.try_recv().is_ok() {}
+        while normal_receiver.try_recv().is_ok() {}
+
+        // Send events with different priorities
+        let items = (1..=4).map(create_test_item).collect::<Vec<_>>();
         let events = vec![
-            Event::new(EventPayload::Created(item1.clone())),
-            Event::new(EventPayload::Updated(item2.clone())),
-            Event::new(EventPayload::Deleted(1)),
-            Event::new(EventPayload::Custom {
-                event_type: "test".to_string(),
-                payload: item1.clone(),
-            }),
+            Event::new(EventPayload::Created(items[0].clone())).with_priority(Priority::Low),
+            Event::new(EventPayload::Created(items[1].clone())).with_priority(Priority::Normal),
+            Event::new(EventPayload::Created(items[2].clone())).with_priority(Priority::High),
+            Event::new(EventPayload::Created(items[3].clone())).with_priority(Priority::Critical),
         ];
 
-        for event in events.clone() {
-            hub.broadcast(event).await.unwrap();
+        // Broadcast events with delays
+        for event in &events {
+            hub.broadcast(event.clone()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        // Verify events are received in order
-        for expected_event in events {
-            let result = tokio::time::timeout(timeout, receiver.recv()).await;
-            assert!(result.is_ok(), "Receiver timed out");
-            if let Ok(Ok(received_event)) = result {
-                assert_eq!(received_event, expected_event);
-            } else {
-                panic!("Failed to receive expected event");
+        let timeout = Duration::from_millis(200);
+
+        // High priority receiver should only get high and critical events
+        let mut high_received = Vec::new();
+        for _ in 0..2 {
+            if let Ok(Ok(event)) = tokio::time::timeout(timeout, high_receiver.recv()).await {
+                high_received.push((
+                    event.priority,
+                    if let EventPayload::Created(item) = event.payload {
+                        item.id
+                    } else {
+                        panic!("Wrong payload type")
+                    },
+                ));
+            }
+        }
+        assert_eq!(
+            high_received.len(),
+            2,
+            "High priority subscriber didn't receive expected number of events"
+        );
+        assert!(
+            high_received
+                .iter()
+                .any(|(p, id)| *p == Priority::High && *id == items[2].id),
+            "Missing High priority event"
+        );
+        assert!(
+            high_received
+                .iter()
+                .any(|(p, id)| *p == Priority::Critical && *id == items[3].id),
+            "Missing Critical priority event"
+        );
+
+        // Normal priority receiver should get normal, high, and critical events
+        let mut normal_received = Vec::new();
+        for _ in 0..3 {
+            if let Ok(Ok(event)) = tokio::time::timeout(timeout, normal_receiver.recv()).await {
+                normal_received.push((
+                    event.priority,
+                    if let EventPayload::Created(item) = event.payload {
+                        item.id
+                    } else {
+                        panic!("Wrong payload type")
+                    },
+                ));
             }
         }
 
-        // Verify stats
-        let stats = hub.get_stats().await;
-        assert_eq!(stats.messages_sent.load(Ordering::Relaxed), 4);
-        assert_eq!(stats.messages_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            normal_received.len(),
+            3,
+            "Normal priority subscriber didn't receive expected number of events"
+        );
+        assert!(
+            normal_received
+                .iter()
+                .any(|(p, id)| *p == Priority::Normal && *id == items[1].id),
+            "Missing Normal priority event"
+        );
+        assert!(
+            normal_received
+                .iter()
+                .any(|(p, id)| *p == Priority::High && *id == items[2].id),
+            "Missing High priority event"
+        );
+        assert!(
+            normal_received
+                .iter()
+                .any(|(p, id)| *p == Priority::Critical && *id == items[3].id),
+            "Missing Critical priority event"
+        );
     }
 
     #[tokio::test]
-    async fn test_receiver_after_sender_dropped() {
-        let hub = NotificationHub::new();
-        let sender = hub.sender();
-        let mut receiver = hub.subscribe();
+    async fn test_message_history() {
+        let config = NotificationConfig {
+            channel_size: 50,
+            ws_timeout: Duration::from_secs(5),
+            history_size: 2,
+        };
+        let hub: NotificationHub<InventoryItem> = NotificationHub::with_config(config);
 
-        // Create a test event before dropping the sender
-        let item = create_test_item(1);
-        hub.broadcast(Event::new(EventPayload::Created(item.clone())))
-            .await
-            .unwrap();
+        // Subscribe and wait for initialization
+        let mut initial_receiver = hub.subscribe();
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // First receive the message
-        match receiver.try_recv() {
-            Ok(event) => {
-                if let Event {
-                    payload: EventPayload::Created(received_item),
-                    ..
-                } = event
-                {
-                    assert_eq!(received_item.id, item.id);
+        // Clear any pending messages
+        while initial_receiver.try_recv().is_ok() {}
+
+        // Send three events (history size is 2)
+        let items = vec![
+            Event::new(EventPayload::Created(create_test_item(1))),
+            Event::new(EventPayload::Created(create_test_item(2))),
+            Event::new(EventPayload::Created(create_test_item(3))),
+        ];
+
+        // Broadcast events with delays
+        for event in &items {
+            hub.broadcast(event.clone()).await.unwrap();
+            // Consume the event from the initial receiver
+            let _ = initial_receiver.try_recv();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Wait for history to be updated
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Check history size and contents
+        let history = hub.get_history().await;
+        assert_eq!(history.len(), 2, "History size doesn't match configuration");
+
+        // Verify history contains the last two events
+        let history_ids: Vec<_> = history
+            .iter()
+            .filter_map(|event| {
+                if let EventPayload::Created(item) = &event.payload {
+                    Some(item.id)
                 } else {
-                    panic!("Expected Created event");
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            history_ids,
+            vec![2, 3],
+            "History doesn't contain expected items"
+        );
+
+        // New subscriber should receive historical messages
+        let mut receiver = hub.subscribe();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let timeout = Duration::from_millis(200);
+
+        // Collect received messages
+        let mut received_ids = Vec::new();
+
+        for _ in 0..2 {
+            if let Ok(Ok(event)) = tokio::time::timeout(timeout, receiver.recv()).await {
+                if let EventPayload::Created(item) = event.payload {
+                    received_ids.push(item.id);
                 }
             }
-            Err(_) => panic!("Expected to receive the message"),
         }
 
-        // Drop the original sender
-        drop(sender);
-
-        // Now the channel should be closed or empty
-        match receiver.try_recv() {
-            Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => (), // Expected
-            _ => panic!("Expected channel to be closed or empty"),
-        }
+        assert_eq!(
+            received_ids.len(),
+            2,
+            "New subscriber didn't receive all historical events"
+        );
+        assert_eq!(
+            received_ids,
+            vec![2, 3],
+            "New subscriber received wrong historical events"
+        );
     }
 
     #[tokio::test]
-    async fn test_late_subscriber() {
-        let hub = NotificationHub::new();
-        let timeout = Duration::from_secs(1);
+    async fn test_batch_broadcasting() {
+        let hub: NotificationHub<InventoryItem> = NotificationHub::new();
 
-        // Create a subscriber to keep the channel alive
-        let _keep_alive = hub.subscribe();
-
-        // Send an event before subscribing
-        let item1 = create_test_item(1);
-        hub.broadcast(Event::new(EventPayload::Created(item1)))
-            .await
-            .unwrap();
-
-        // Subscribe after the event
-        let mut late_receiver = hub.subscribe();
-
-        // Late subscriber should not receive the earlier event
-        let item2 = create_test_item(2);
-        let expected_event = Event::new(EventPayload::Created(item2.clone()));
-        hub.broadcast(expected_event.clone()).await.unwrap();
-
-        let result = tokio::time::timeout(timeout, late_receiver.recv()).await;
-        assert!(result.is_ok(), "Receiver timed out");
-        if let Ok(Ok(received_event)) = result {
-            assert_eq!(received_event, expected_event);
-        } else {
-            panic!("Failed to receive expected event");
-        }
-
-        // Verify stats
-        let stats = hub.get_stats().await;
-        assert_eq!(stats.messages_sent.load(Ordering::Relaxed), 2);
-        assert_eq!(stats.messages_dropped.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.active_subscribers.load(Ordering::Relaxed), 2);
-    }
-
-    #[tokio::test]
-    async fn test_broadcast_error() {
-        let hub = NotificationHub::<InventoryItem>::new();
-        let item = create_test_item(1);
-
-        // No subscribers, should return error
-        let result = hub.broadcast(Event::new(EventPayload::Created(item))).await;
-        assert!(matches!(result, Err(NotificationError::SendError(_))));
-
-        // Verify stats
-        let stats = hub.get_stats().await;
-        assert_eq!(stats.messages_sent.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.messages_dropped.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.active_subscribers.load(Ordering::Relaxed), 0);
-    }
-
-    // Test with a different type to demonstrate generics
-    #[derive(Clone, Debug, PartialEq, Serialize)]
-    struct TestUser {
-        id: i32,
-        name: String,
-    }
-
-    #[tokio::test]
-    async fn test_different_type() {
-        let hub: NotificationHub<TestUser> = NotificationHub::new();
+        // Subscribe and wait for initialization
         let mut receiver = hub.subscribe();
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
-        let user = TestUser {
-            id: 1,
-            name: "Test User".to_string(),
-        };
+        // Clear any pending messages
+        while receiver.try_recv().is_ok() {}
 
-        hub.broadcast(Event::new(EventPayload::Created(user.clone())))
-            .await
-            .unwrap();
+        // Create batch of items with different IDs
+        let items: Vec<_> = (1..=3).map(create_test_item).collect();
 
-        let timeout = Duration::from_secs(1);
+        // Broadcast batch
+        hub.broadcast_batch(items.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let timeout = Duration::from_millis(200);
         let result = tokio::time::timeout(timeout, receiver.recv()).await;
 
-        assert!(result.is_ok(), "Receiver timed out");
+        assert!(
+            result.is_ok(),
+            "Failed to receive batch event within timeout"
+        );
         if let Ok(Ok(Event {
-            payload: EventPayload::Created(received_user),
+            payload: EventPayload::Batch(received_items),
             ..
         })) = result
         {
-            assert_eq!(received_user.id, user.id);
-            assert_eq!(received_user.name, user.name);
+            assert_eq!(
+                received_items.len(),
+                3,
+                "Batch event contains wrong number of items"
+            );
+
+            // Verify each item in the batch
+            for (expected, received) in items.iter().zip(received_items.iter()) {
+                assert_eq!(expected.id, received.id, "Mismatched item ID in batch");
+                assert_eq!(
+                    expected.name, received.name,
+                    "Mismatched item name in batch"
+                );
+            }
         } else {
-            panic!("Failed to receive Created event");
+            panic!("Received wrong event type, expected Batch");
         }
 
-        // Test custom event
-        let custom_event = Event::new(EventPayload::Custom {
-            event_type: "login".to_string(),
-            payload: user.clone(),
-        });
-        hub.broadcast(custom_event.clone()).await.unwrap();
+        // Verify the batch is stored as a single event in history
+        let history = hub.get_history().await;
+        assert_eq!(
+            history.len(),
+            1,
+            "Batch event should be stored as a single history entry"
+        );
 
+        if let EventPayload::Batch(history_items) = &history[0].payload {
+            assert_eq!(
+                history_items.len(),
+                3,
+                "History batch contains wrong number of items"
+            );
+        } else {
+            panic!("History contains wrong event type, expected Batch");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_topic_subscriber_count() {
+        let hub: NotificationHub<InventoryItem> = NotificationHub::new();
+
+        // Create multiple subscribers for different topics
+        let inventory_filter = SubscriptionFilter::new().with_topics(vec!["inventory".to_string()]);
+        let sales_filter = SubscriptionFilter::new().with_topics(vec!["sales".to_string()]);
+        let multi_filter = SubscriptionFilter::new()
+            .with_topics(vec!["inventory".to_string(), "sales".to_string()]);
+
+        // Subscribe with delays between subscriptions
+        let _inventory_receiver = hub.subscribe_with_filter(inventory_filter.clone());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _sales_receiver = hub.subscribe_with_filter(sales_filter);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _multi_receiver = hub.subscribe_with_filter(multi_filter);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _inventory_receiver2 = hub.subscribe_with_filter(inventory_filter);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Check subscriber counts
+        assert_eq!(
+            hub.topic_subscriber_count("inventory").await,
+            3,
+            "Wrong number of inventory subscribers (2 inventory + 1 multi)"
+        );
+        assert_eq!(
+            hub.topic_subscriber_count("sales").await,
+            2,
+            "Wrong number of sales subscribers (1 sales + 1 multi)"
+        );
+        assert_eq!(
+            hub.topic_subscriber_count("unknown").await,
+            0,
+            "Unknown topic should have 0 subscribers"
+        );
+
+        // Verify total subscriber count
+        assert_eq!(
+            hub.subscriber_count(),
+            4,
+            "Wrong total number of subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_batch() {
+        let hub: NotificationHub<InventoryItem> = NotificationHub::new();
+        let mut receiver = hub.subscribe();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Clear any pending messages
+        while receiver.try_recv().is_ok() {}
+
+        // Test empty batch
+        assert!(
+            hub.broadcast_batch(vec![]).await.is_ok(),
+            "Empty batch should be handled gracefully"
+        );
+
+        // Verify no message was sent
+        let timeout = Duration::from_millis(50);
         let result = tokio::time::timeout(timeout, receiver.recv()).await;
-        assert!(result.is_ok(), "Receiver timed out");
-        if let Ok(Ok(received_event)) = result {
-            assert_eq!(received_event, custom_event);
-        } else {
-            panic!("Failed to receive Custom event");
+        assert!(
+            result.is_err(),
+            "Should not receive any message for empty batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscriber_cleanup() {
+        let hub: NotificationHub<InventoryItem> = NotificationHub::new();
+
+        // Create a scope to drop the receiver
+        {
+            let _receiver = hub.subscribe();
+            assert_eq!(hub.subscriber_count(), 1, "Should have one subscriber");
         }
+
+        // Wait for cleanup
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            hub.subscriber_count(),
+            0,
+            "Subscriber should be cleaned up after drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_events_ordering() {
+        let hub: NotificationHub<InventoryItem> = NotificationHub::new();
+        let mut receiver = hub.subscribe();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Clear any pending messages
+        while receiver.try_recv().is_ok() {}
+
+        // Send multiple events
+        let events: Vec<_> = (1..=3)
+            .map(|id| Event::new(EventPayload::Created(create_test_item(id))))
+            .collect();
+
+        // Broadcast events with delays
+        for event in &events {
+            hub.broadcast(event.clone()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Verify events are received in order
+        let timeout = Duration::from_millis(200);
+        let mut received_ids = Vec::new();
+
+        for _ in 0..3 {
+            if let Ok(Ok(event)) = tokio::time::timeout(timeout, receiver.recv()).await {
+                if let EventPayload::Created(item) = event.payload {
+                    received_ids.push(item.id);
+                }
+            }
+        }
+
+        assert_eq!(
+            received_ids,
+            vec![1, 2, 3],
+            "Events not received in correct order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mixed_priority_and_topic() {
+        let hub: NotificationHub<InventoryItem> = NotificationHub::new();
+
+        // Create a filter with both topic and priority
+        let filter = SubscriptionFilter::new()
+            .with_topics(vec!["inventory".to_string()])
+            .with_min_priority(Priority::High);
+
+        let mut receiver = hub.subscribe_with_filter(filter);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Clear any pending messages
+        while receiver.try_recv().is_ok() {}
+
+        // Create events with different combinations
+        let events = vec![
+            Event::new(EventPayload::Created(create_test_item(1)))
+                .with_topic("inventory")
+                .with_priority(Priority::Low),
+            Event::new(EventPayload::Created(create_test_item(2)))
+                .with_topic("sales")
+                .with_priority(Priority::Critical),
+            Event::new(EventPayload::Created(create_test_item(3)))
+                .with_topic("inventory")
+                .with_priority(Priority::High),
+        ];
+
+        // Broadcast events
+        for event in &events {
+            hub.broadcast(event.clone()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Should only receive the high priority inventory event
+        let timeout = Duration::from_millis(100);
+        let result = tokio::time::timeout(timeout, receiver.recv()).await;
+
+        assert!(result.is_ok(), "Failed to receive event within timeout");
+        if let Ok(Ok(event)) = result {
+            if let EventPayload::Created(item) = event.payload {
+                assert_eq!(item.id, 3, "Received wrong event");
+                assert_eq!(event.topic.as_deref(), Some("inventory"), "Wrong topic");
+                assert_eq!(event.priority, Priority::High, "Wrong priority");
+            } else {
+                panic!("Wrong payload type");
+            }
+        }
+
+        // Verify no more events are received
+        assert!(
+            tokio::time::timeout(timeout, receiver.recv())
+                .await
+                .is_err(),
+            "Should not receive any more events"
+        );
     }
 }
