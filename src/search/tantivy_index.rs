@@ -61,7 +61,7 @@ impl TantivyIndex {
 
 #[async_trait]
 impl SearchIndex for TantivyIndex {
-    async fn add_document(&mut self, title: &str, body: &str) -> Result<()> {
+    async fn add_document(&self, title: &str, body: &str) -> Result<()> {
         let doc = self.create_document(title, body);
         let mut writer = self.writer.lock().unwrap();
         writer.add_document(doc)?;
@@ -69,7 +69,7 @@ impl SearchIndex for TantivyIndex {
         Ok(())
     }
 
-    async fn delete_document(&mut self, _id: i32) -> Result<()> {
+    async fn delete_document(&self, _id: i32) -> Result<()> {
         // Note: Tantivy doesn't support document deletion by external ID
         // In a production system, we'd need to maintain a mapping between
         // our document IDs and Tantivy's internal document IDs
@@ -103,7 +103,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_index_and_search() -> Result<()> {
-        let mut index = TantivyIndex::new()?;
+        let index = TantivyIndex::new()?;
 
         // Add test documents
         index
@@ -140,7 +140,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_document() -> Result<()> {
-        let mut index = TantivyIndex::new()?;
+        let index = TantivyIndex::new()?;
 
         // Add a test document
         index

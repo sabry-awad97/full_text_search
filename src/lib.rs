@@ -35,8 +35,7 @@ impl<S: DocumentStorage, I: SearchIndex> SearchEngine<S, I> {
 
     pub async fn add_document(&self, title: &str, body: &str) -> Result<i32> {
         let id = self.storage.add_document(title, body).await?;
-        let mut index = self.index.clone();
-        index.add_document(title, body).await?;
+        self.index.add_document(title, body).await?;
 
         let doc = SearchDocument {
             id,
@@ -53,7 +52,7 @@ impl<S: DocumentStorage, I: SearchIndex> SearchEngine<S, I> {
     }
 
     pub async fn delete_document(&self, id: i32) -> Result<()> {
-        let mut index = self.index.clone();
+        let index = self.index.clone();
         index.delete_document(id).await?;
         self.storage.delete_document(id).await?;
         let _ = self.notification_tx.send(DocumentEvent::Deleted(id));

@@ -1,43 +1,40 @@
 use crate::search::SearchIndex;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use dashmap::DashMap;
 
 #[derive(Clone, Default)]
 pub struct MemoryIndex {
-    documents: Arc<Mutex<HashMap<i32, (String, String)>>>,
+    documents: DashMap<i32, (String, String)>,
 }
 
 impl MemoryIndex {
     pub fn new() -> Self {
-        Self {
-            documents: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::default()
     }
 }
 
 #[async_trait]
 impl SearchIndex for MemoryIndex {
-    async fn add_document(&mut self, title: &str, body: &str) -> Result<()> {
-        let mut documents = self.documents.lock().unwrap();
-        let id = documents.len() as i32 + 1;
-        documents.insert(id, (title.to_string(), body.to_string()));
+    async fn add_document(&self, title: &str, body: &str) -> Result<()> {
+        let id = self.documents.len() as i32 + 1;
+        self.documents
+            .insert(id, (title.to_string(), body.to_string()));
         Ok(())
     }
 
-    async fn delete_document(&mut self, id: i32) -> Result<()> {
-        let mut documents = self.documents.lock().unwrap();
-        documents.remove(&id);
+    async fn delete_document(&self, id: i32) -> Result<()> {
+        self.documents.remove(&id);
         Ok(())
     }
 
     async fn search(&self, query: &str) -> Result<Vec<(i32, f32)>> {
-        let documents = self.documents.lock().unwrap();
         let query = query.to_lowercase();
         let mut results = Vec::new();
 
-        for (&id, (title, body)) in documents.iter() {
+        for entry in self.documents.iter() {
+            let id = *entry.key();
+            let (title, body) = entry.value();
             if title.to_lowercase().contains(&query) || body.to_lowercase().contains(&query) {
                 results.push((id, 1.0));
             }
@@ -53,7 +50,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_index_and_search() -> Result<()> {
-        let mut index = MemoryIndex::new();
+        let index = MemoryIndex::new();
 
         // Add test documents
         index
@@ -78,7 +75,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_document() -> Result<()> {
-        let mut index = MemoryIndex::new();
+        let index = MemoryIndex::new();
 
         // Add a document
         index.add_document("Test Doc", "Test content").await?;
@@ -99,7 +96,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_case_insensitive_search() -> Result<()> {
-        let mut index = MemoryIndex::new();
+        let index = MemoryIndex::new();
 
         index
             .add_document("UPPERCASE TITLE", "UPPERCASE CONTENT")
