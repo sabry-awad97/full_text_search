@@ -2,12 +2,11 @@ use crate::entities::documents::Model as SearchDocument;
 use crate::storage::DocumentStorage;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use dashmap::DashMap;
 
 #[derive(Clone, Default)]
 pub struct MemoryStorage {
-    documents: Arc<Mutex<HashMap<i32, SearchDocument>>>,
+    documents: DashMap<i32, SearchDocument>,
 }
 
 impl MemoryStorage {
@@ -19,28 +18,25 @@ impl MemoryStorage {
 #[async_trait]
 impl DocumentStorage for MemoryStorage {
     async fn add_document(&self, title: &str, body: &str) -> Result<i32> {
-        let mut documents = self.documents.lock().unwrap();
-        let id = documents.len() as i32 + 1;
+        let id = self.documents.len() as i32 + 1;
         let doc = SearchDocument {
             id,
             title: title.to_string(),
             body: body.to_string(),
         };
-        documents.insert(id, doc);
+        self.documents.insert(id, doc);
         Ok(id)
     }
 
     async fn get_document(&self, id: i32) -> Result<SearchDocument> {
-        let documents = self.documents.lock().unwrap();
-        documents
+        self.documents
             .get(&id)
-            .cloned()
+            .map(|doc| doc.clone())
             .ok_or_else(|| anyhow::anyhow!("Document not found"))
     }
 
     async fn delete_document(&self, id: i32) -> Result<()> {
-        let mut documents = self.documents.lock().unwrap();
-        documents.remove(&id);
+        self.documents.remove(&id);
         Ok(())
     }
 }
