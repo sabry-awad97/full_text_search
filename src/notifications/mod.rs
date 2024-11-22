@@ -2,6 +2,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::{
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -23,6 +24,8 @@ use tracing::{debug, error, info};
 const DEFAULT_CHANNEL_SIZE: usize = 1024;
 /// Default timeout for WebSocket operations in seconds
 const DEFAULT_WS_TIMEOUT_SECS: u64 = 30;
+/// Default number of messages to keep in history
+const DEFAULT_HISTORY_SIZE: usize = 100;
 
 #[derive(Debug, Error)]
 pub enum NotificationError {
@@ -34,11 +37,36 @@ pub enum NotificationError {
     SerializationError(String),
     #[error("Operation timed out")]
     Timeout,
+    #[error("Invalid topic: {0}")]
+    InvalidTopic(String),
+}
+
+/// Message priority levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum Priority {
+    Low,
+    Normal,
+    High,
+    Critical,
+}
+
+impl Default for Priority {
+    fn default() -> Self {
+        Self::Normal
+    }
 }
 
 /// Represents different types of events that can be broadcasted
 #[derive(Clone, Debug, Serialize, PartialEq)]
-pub enum Event<T> {
+pub struct Event<T> {
+    payload: EventPayload<T>,
+    topic: Option<String>,
+    priority: Priority,
+    timestamp: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub enum EventPayload<T> {
     Created(T),
     Updated(T),
     Deleted(i32),
@@ -47,6 +75,32 @@ pub enum Event<T> {
         event_type: String,
         payload: T,
     },
+    /// Batch events for efficient processing
+    Batch(Vec<T>),
+}
+
+impl<T> Event<T> {
+    pub fn new(payload: EventPayload<T>) -> Self {
+        Self {
+            payload,
+            topic: None,
+            priority: Priority::default(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        }
+    }
+
+    pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
+        self.topic = Some(topic.into());
+        self
+    }
+
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
+        self
+    }
 }
 
 /// Statistics for monitoring the notification system
@@ -90,6 +144,7 @@ impl NotificationStats {
 pub struct NotificationConfig {
     channel_size: usize,
     ws_timeout: Duration,
+    history_size: usize,
 }
 
 impl Default for NotificationConfig {
@@ -97,7 +152,55 @@ impl Default for NotificationConfig {
         Self {
             channel_size: DEFAULT_CHANNEL_SIZE,
             ws_timeout: Duration::from_secs(DEFAULT_WS_TIMEOUT_SECS),
+            history_size: DEFAULT_HISTORY_SIZE,
         }
+    }
+}
+
+/// Subscription filter for receiving specific events
+#[derive(Clone, Debug)]
+pub struct SubscriptionFilter {
+    topics: Option<Vec<String>>,
+    min_priority: Priority,
+}
+
+impl Default for SubscriptionFilter {
+    fn default() -> Self {
+        Self {
+            topics: None,
+            min_priority: Priority::Low,
+        }
+    }
+}
+
+impl SubscriptionFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_topics(mut self, topics: Vec<String>) -> Self {
+        self.topics = Some(topics);
+        self
+    }
+
+    pub fn with_min_priority(mut self, priority: Priority) -> Self {
+        self.min_priority = priority;
+        self
+    }
+
+    fn matches(&self, event: &Event<impl Clone>) -> bool {
+        if event.priority < self.min_priority {
+            return false;
+        }
+
+        if let Some(topics) = &self.topics {
+            if let Some(event_topic) = &event.topic {
+                return topics.iter().any(|t| t == event_topic);
+            }
+            return false;
+        }
+
+        true
     }
 }
 
@@ -108,6 +211,8 @@ pub struct NotificationHub<T> {
     stats: Arc<NotificationStats>,
     #[allow(dead_code)]
     config: NotificationConfig,
+    message_history: Arc<RwLock<VecDeque<Event<T>>>>,
+    topic_subscribers: Arc<RwLock<HashMap<String, usize>>>,
 }
 
 impl<T> NotificationHub<T>
@@ -125,7 +230,9 @@ where
         Self {
             sender,
             stats: Arc::new(NotificationStats::new()),
-            config,
+            config: config.clone(),
+            message_history: Arc::new(RwLock::new(VecDeque::with_capacity(config.history_size))),
+            topic_subscribers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -134,15 +241,46 @@ where
         self.sender.clone()
     }
 
+    /// Creates a new subscriber with optional filter
+    pub async fn subscribe_with_filter(&self, filter: SubscriptionFilter) -> Receiver<Event<T>> {
+        self.stats.record_subscriber_added();
+
+        // Update topic subscriber count
+        if let Some(topics) = &filter.topics {
+            let mut topic_subs = self.topic_subscribers.write().await;
+            for topic in topics {
+                *topic_subs.entry(topic.clone()).or_default() += 1;
+            }
+        }
+
+        // Send historical messages that match the filter
+        let history = self.message_history.read().await;
+        for event in history.iter() {
+            if filter.matches(event) {
+                let _ = self.sender.send(event.clone());
+            }
+        }
+
+        self.sender.subscribe()
+    }
+
     /// Creates a new subscriber
     pub fn subscribe(&self) -> Receiver<Event<T>> {
         self.stats.record_subscriber_added();
-
         self.sender.subscribe()
     }
 
     /// Broadcasts an event to all subscribers
     pub async fn broadcast(&self, event: Event<T>) -> Result<(), NotificationError> {
+        // Store in history
+        {
+            let mut history = self.message_history.write().await;
+            if history.len() >= self.config.history_size {
+                history.pop_front();
+            }
+            history.push_back(event.clone());
+        }
+
         match self.sender.send(event.clone()) {
             Ok(receiver_count) => {
                 self.stats.record_message_sent();
@@ -161,6 +299,26 @@ where
         }
     }
 
+    /// Broadcasts multiple events as a batch
+    pub async fn broadcast_batch(&self, events: Vec<T>) -> Result<(), NotificationError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let batch_event = Event::new(EventPayload::Batch(events));
+        self.broadcast(batch_event).await
+    }
+
+    /// Returns the number of subscribers for a specific topic
+    pub async fn topic_subscriber_count(&self, topic: &str) -> usize {
+        self.topic_subscribers
+            .read()
+            .await
+            .get(topic)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Returns the current number of subscribers
     pub fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
@@ -176,6 +334,11 @@ where
             ),
             last_broadcast: RwLock::new(*self.stats.last_broadcast.read().await),
         }
+    }
+
+    /// Returns the message history
+    pub async fn get_history(&self) -> Vec<Event<T>> {
+        self.message_history.read().await.iter().cloned().collect()
     }
 
     /// Handles a WebSocket connection with timeout and error handling
@@ -245,8 +408,6 @@ where
     /// Gracefully shuts down the notification hub
     pub async fn shutdown(&self) {
         info!("Shutting down NotificationHub");
-        // Broadcast a final message if needed
-        // Clean up resources
         // The broadcast channel will be automatically closed when the last sender is dropped
     }
 }
@@ -301,6 +462,7 @@ mod tests {
         let config = NotificationConfig {
             channel_size: 50,
             ws_timeout: Duration::from_secs(5),
+            history_size: 50,
         };
         let hub: NotificationHub<InventoryItem> = NotificationHub::with_config(config);
         assert_eq!(hub.subscriber_count(), 0);
@@ -316,14 +478,20 @@ mod tests {
 
         // Test Created event
         let item = create_test_item(1);
-        hub.broadcast(Event::Created(item.clone())).await.unwrap();
+        hub.broadcast(Event::new(EventPayload::Created(item.clone())))
+            .await
+            .unwrap();
 
         // Use timeout to prevent test from hanging
         let timeout = Duration::from_secs(1);
 
         let result1 = tokio::time::timeout(timeout, receiver1.recv()).await;
         assert!(result1.is_ok(), "Receiver 1 timed out");
-        if let Ok(Ok(Event::Created(received_item))) = result1 {
+        if let Ok(Ok(Event {
+            payload: EventPayload::Created(received_item),
+            ..
+        })) = result1
+        {
             assert_eq!(received_item.id, 1);
             assert_eq!(received_item.name, "Test Item 1");
         } else {
@@ -332,7 +500,11 @@ mod tests {
 
         let result2 = tokio::time::timeout(timeout, receiver2.recv()).await;
         assert!(result2.is_ok(), "Receiver 2 timed out");
-        if let Ok(Ok(Event::Created(received_item))) = result2 {
+        if let Ok(Ok(Event {
+            payload: EventPayload::Created(received_item),
+            ..
+        })) = result2
+        {
             assert_eq!(received_item.id, 1);
             assert_eq!(received_item.name, "Test Item 1");
         } else {
@@ -358,13 +530,13 @@ mod tests {
 
         // Test all event types
         let events = vec![
-            Event::Created(item1.clone()),
-            Event::Updated(item2.clone()),
-            Event::Deleted(1),
-            Event::Custom {
+            Event::new(EventPayload::Created(item1.clone())),
+            Event::new(EventPayload::Updated(item2.clone())),
+            Event::new(EventPayload::Deleted(1)),
+            Event::new(EventPayload::Custom {
                 event_type: "test".to_string(),
                 payload: item1.clone(),
-            },
+            }),
         ];
 
         for event in events.clone() {
@@ -396,12 +568,18 @@ mod tests {
 
         // Create a test event before dropping the sender
         let item = create_test_item(1);
-        hub.broadcast(Event::Created(item.clone())).await.unwrap();
+        hub.broadcast(Event::new(EventPayload::Created(item.clone())))
+            .await
+            .unwrap();
 
         // First receive the message
         match receiver.try_recv() {
             Ok(event) => {
-                if let Event::Created(received_item) = event {
+                if let Event {
+                    payload: EventPayload::Created(received_item),
+                    ..
+                } = event
+                {
                     assert_eq!(received_item.id, item.id);
                 } else {
                     panic!("Expected Created event");
@@ -430,14 +608,16 @@ mod tests {
 
         // Send an event before subscribing
         let item1 = create_test_item(1);
-        hub.broadcast(Event::Created(item1)).await.unwrap();
+        hub.broadcast(Event::new(EventPayload::Created(item1)))
+            .await
+            .unwrap();
 
         // Subscribe after the event
         let mut late_receiver = hub.subscribe();
 
         // Late subscriber should not receive the earlier event
         let item2 = create_test_item(2);
-        let expected_event = Event::Created(item2.clone());
+        let expected_event = Event::new(EventPayload::Created(item2.clone()));
         hub.broadcast(expected_event.clone()).await.unwrap();
 
         let result = tokio::time::timeout(timeout, late_receiver.recv()).await;
@@ -461,7 +641,7 @@ mod tests {
         let item = create_test_item(1);
 
         // No subscribers, should return error
-        let result = hub.broadcast(Event::Created(item)).await;
+        let result = hub.broadcast(Event::new(EventPayload::Created(item))).await;
         assert!(matches!(result, Err(NotificationError::SendError(_))));
 
         // Verify stats
@@ -488,13 +668,19 @@ mod tests {
             name: "Test User".to_string(),
         };
 
-        hub.broadcast(Event::Created(user.clone())).await.unwrap();
+        hub.broadcast(Event::new(EventPayload::Created(user.clone())))
+            .await
+            .unwrap();
 
         let timeout = Duration::from_secs(1);
         let result = tokio::time::timeout(timeout, receiver.recv()).await;
 
         assert!(result.is_ok(), "Receiver timed out");
-        if let Ok(Ok(Event::Created(received_user))) = result {
+        if let Ok(Ok(Event {
+            payload: EventPayload::Created(received_user),
+            ..
+        })) = result
+        {
             assert_eq!(received_user.id, user.id);
             assert_eq!(received_user.name, user.name);
         } else {
@@ -502,10 +688,10 @@ mod tests {
         }
 
         // Test custom event
-        let custom_event = Event::Custom {
+        let custom_event = Event::new(EventPayload::Custom {
             event_type: "login".to_string(),
             payload: user.clone(),
-        };
+        });
         hub.broadcast(custom_event.clone()).await.unwrap();
 
         let result = tokio::time::timeout(timeout, receiver.recv()).await;
