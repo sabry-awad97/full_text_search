@@ -1,38 +1,31 @@
+use crate::entities::documents::{self, Entity as Documents};
 use crate::models::SearchDocument;
 use crate::storage::DocumentStorage;
 use anyhow::Result;
 use async_trait::async_trait;
-use sqlx::postgres::{PgPool, PgPoolOptions};
-
+use sea_orm::ConnectionTrait;
+use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, EntityTrait, Set};
 pub struct PostgresStorage {
-    pool: PgPool,
+    db: DatabaseConnection,
 }
 
 impl PostgresStorage {
     pub async fn new(database_url: &str) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(database_url)
-            .await?;
-
-        Self::init_database(&pool).await?;
-
-        Ok(Self { pool })
+        let db = Database::connect(database_url).await?;
+        Self::init_database(&db).await?;
+        Ok(Self { db })
     }
 
-    async fn init_database(pool: &PgPool) -> Result<()> {
-        sqlx::query(
-            r#"
+    async fn init_database(db: &DatabaseConnection) -> Result<()> {
+        let schema = r#"
             CREATE TABLE IF NOT EXISTS documents (
                 id SERIAL PRIMARY KEY,
                 title TEXT NOT NULL,
                 body TEXT NOT NULL
             )
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
+        "#;
+        let stmt = sea_orm::Statement::from_string(db.get_database_backend(), schema.to_owned());
+        db.execute(stmt).await?;
         Ok(())
     }
 }
@@ -40,33 +33,29 @@ impl PostgresStorage {
 #[async_trait]
 impl DocumentStorage for PostgresStorage {
     async fn add_document(&self, title: &str, body: &str) -> Result<i32> {
-        let doc = sqlx::query_as::<_, SearchDocument>(
-            "INSERT INTO documents (title, body) VALUES ($1, $2) RETURNING id, title, body",
-        )
-        .bind(title)
-        .bind(body)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(doc.id)
+        let document = documents::ActiveModel {
+            title: Set(title.to_owned()),
+            body: Set(body.to_owned()),
+            ..Default::default()
+        };
+        let res = document.insert(&self.db).await?;
+        Ok(res.id)
     }
 
     async fn get_document(&self, id: i32) -> Result<SearchDocument> {
-        let doc = sqlx::query_as::<_, SearchDocument>(
-            "SELECT id, title, body FROM documents WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(doc)
+        let doc = Documents::find_by_id(id)
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Document not found"))?;
+        Ok(SearchDocument {
+            id: doc.id,
+            title: doc.title,
+            body: doc.body,
+        })
     }
 
     async fn delete_document(&self, id: i32) -> Result<()> {
-        sqlx::query("DELETE FROM documents WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        Documents::delete_by_id(id).exec(&self.db).await?;
         Ok(())
     }
 }
@@ -83,9 +72,11 @@ mod tests {
     }
 
     async fn cleanup_test_db(storage: &PostgresStorage) -> Result<()> {
-        sqlx::query("DELETE FROM documents")
-            .execute(&storage.pool)
-            .await?;
+        let stmt = sea_orm::Statement::from_string(
+            storage.db.get_database_backend(),
+            "DELETE FROM documents".to_owned(),
+        );
+        storage.db.execute(stmt).await?;
         Ok(())
     }
 
