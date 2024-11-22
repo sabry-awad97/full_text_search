@@ -1,9 +1,10 @@
 use axum::extract::ws::{Message, WebSocket};
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -20,6 +21,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
+use uuid::Uuid;
 
 /// Maximum number of messages that can be stored in the broadcast channel
 const DEFAULT_CHANNEL_SIZE: usize = 1024;
@@ -43,23 +45,19 @@ pub enum NotificationError {
 }
 
 /// Message priority levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Priority {
     Low,
+    #[default]
     Normal,
     High,
     Critical,
 }
 
-impl Default for Priority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
 /// Represents different types of events that can be broadcasted
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Event<T> {
+    pub id: Uuid,
     pub payload: EventPayload<T>,
     pub topic: Option<String>,
     pub priority: Priority,
@@ -83,6 +81,7 @@ pub enum EventPayload<T> {
 impl<T> Event<T> {
     pub fn new(payload: EventPayload<T>) -> Self {
         Self {
+            id: Uuid::new_v4(),
             payload,
             topic: None,
             priority: Priority::default(),
@@ -210,7 +209,7 @@ pub struct NotificationHub<T> {
     #[allow(dead_code)]
     config: NotificationConfig,
     message_history: Arc<RwLock<VecDeque<Event<T>>>>,
-    topic_subscribers: Arc<RwLock<HashMap<String, usize>>>,
+    topic_subscribers: Arc<DashMap<String, usize>>,
 }
 
 impl<T> NotificationHub<T>
@@ -230,7 +229,7 @@ where
             stats: Arc::new(NotificationStats::new()),
             config: config.clone(),
             message_history: Arc::new(RwLock::new(VecDeque::with_capacity(config.history_size))),
-            topic_subscribers: Arc::new(RwLock::new(HashMap::new())),
+            topic_subscribers: Arc::new(DashMap::new()),
         }
     }
 
@@ -249,10 +248,11 @@ where
 
         // Update topic subscriber count
         if let Some(topics) = &filter.topics {
-            if let Ok(mut topic_subs) = self.topic_subscribers.try_write() {
-                for topic in topics {
-                    *topic_subs.entry(topic.clone()).or_default() += 1;
-                }
+            for topic in topics {
+                self.topic_subscribers
+                    .entry(topic.clone())
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
             }
         }
 
@@ -334,13 +334,8 @@ where
     }
 
     /// Returns the number of subscribers for a specific topic
-    pub async fn topic_subscriber_count(&self, topic: &str) -> usize {
-        self.topic_subscribers
-            .read()
-            .await
-            .get(topic)
-            .copied()
-            .unwrap_or(0)
+    pub fn topic_subscriber_count(&self, topic: &str) -> usize {
+        self.topic_subscribers.get(topic).map(|r| *r).unwrap_or(0)
     }
 
     /// Returns the current number of subscribers
@@ -885,17 +880,17 @@ mod tests {
 
         // Check subscriber counts
         assert_eq!(
-            hub.topic_subscriber_count("inventory").await,
+            hub.topic_subscriber_count("inventory"),
             3,
             "Wrong number of inventory subscribers (2 inventory + 1 multi)"
         );
         assert_eq!(
-            hub.topic_subscriber_count("sales").await,
+            hub.topic_subscriber_count("sales"),
             2,
             "Wrong number of sales subscribers (1 sales + 1 multi)"
         );
         assert_eq!(
-            hub.topic_subscriber_count("unknown").await,
+            hub.topic_subscriber_count("unknown"),
             0,
             "Unknown topic should have 0 subscribers"
         );
