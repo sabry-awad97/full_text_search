@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.75"
+async-trait = "0.1.73"
+derive-getters = "0.5.0"
 dotenvy = "0.15"
 futures = "0.3.28"
 serde = { version = "1.0.188", features = ["derive"] }
@@ -14,3 +16,6 @@ tantivy = "0.19"
 tempfile = "3.8.0"
 tokio = { version = "1.32.0", features = ["full"] }
 tokio-stream = { version = "0.1.14", features = ["sync"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
