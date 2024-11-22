@@ -1,5 +1,6 @@
 pub mod entities;
 mod models;
+pub mod notifications;
 pub mod search;
 pub mod storage;
 
