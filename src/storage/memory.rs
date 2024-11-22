@@ -1,4 +1,4 @@
-use crate::models::SearchDocument;
+use crate::entities::documents::Model as SearchDocument;
 use crate::storage::DocumentStorage;
 use anyhow::Result;
 use async_trait::async_trait;

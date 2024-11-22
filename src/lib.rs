@@ -3,7 +3,8 @@ mod models;
 pub mod search;
 pub mod storage;
 
-pub use models::{DocumentEvent, SearchDocument};
+use entities::documents::Model as SearchDocument;
+pub use models::DocumentEvent;
 
 use anyhow::Result;
 use search::SearchIndex;

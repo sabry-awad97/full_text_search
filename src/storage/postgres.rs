@@ -1,19 +1,20 @@
-use crate::entities::documents::{self, Entity as Documents};
-use crate::models::SearchDocument;
+use crate::entities::documents::{self, Entity as Documents, Model as SearchDocument};
 use crate::storage::DocumentStorage;
 use anyhow::Result;
 use async_trait::async_trait;
 use sea_orm::ConnectionTrait;
 use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, EntityTrait, Set};
+use std::sync::Arc;
+
 pub struct PostgresStorage {
-    db: DatabaseConnection,
+    db: Arc<DatabaseConnection>,
 }
 
 impl PostgresStorage {
     pub async fn new(database_url: &str) -> Result<Self> {
         let db = Database::connect(database_url).await?;
         Self::init_database(&db).await?;
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
     }
 
     async fn init_database(db: &DatabaseConnection) -> Result<()> {
@@ -38,15 +39,16 @@ impl DocumentStorage for PostgresStorage {
             body: Set(body.to_owned()),
             ..Default::default()
         };
-        let res = document.insert(&self.db).await?;
+
+        let res = document.insert(self.db.as_ref()).await?;
         Ok(res.id)
     }
 
     async fn get_document(&self, id: i32) -> Result<SearchDocument> {
         let doc = Documents::find_by_id(id)
-            .one(&self.db)
+            .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Document not found"))?;
+            .ok_or_else(|| anyhow::anyhow!("Document not found: {}", id))?;
         Ok(SearchDocument {
             id: doc.id,
             title: doc.title,
@@ -55,7 +57,7 @@ impl DocumentStorage for PostgresStorage {
     }
 
     async fn delete_document(&self, id: i32) -> Result<()> {
-        Documents::delete_by_id(id).exec(&self.db).await?;
+        Documents::delete_by_id(id).exec(self.db.as_ref()).await?;
         Ok(())
     }
 }
@@ -74,7 +76,7 @@ mod tests {
     async fn cleanup_test_db(storage: &PostgresStorage) -> Result<()> {
         let stmt = sea_orm::Statement::from_string(
             storage.db.get_database_backend(),
-            "DELETE FROM documents".to_owned(),
+            "TRUNCATE TABLE documents RESTART IDENTITY CASCADE".to_owned(),
         );
         storage.db.execute(stmt).await?;
         Ok(())
@@ -107,18 +109,25 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_documents() -> Result<()> {
         let storage = setup_test_db().await?;
+        println!("Test DB setup complete");
         cleanup_test_db(&storage).await?;
+        println!("Test DB cleaned up");
 
         let id1 = storage.add_document("First Doc", "First Content").await?;
+        println!("Added first document with id: {}", id1);
         let id2 = storage.add_document("Second Doc", "Second Content").await?;
+        println!("Added second document with id: {}", id2);
 
         let doc1 = storage.get_document(id1).await?;
+        println!("Retrieved first document: {} - {}", doc1.title, doc1.body);
         let doc2 = storage.get_document(id2).await?;
+        println!("Retrieved second document: {} - {}", doc2.title, doc2.body);
 
         assert_eq!(doc1.title, "First Doc");
         assert_eq!(doc2.title, "Second Doc");
 
         cleanup_test_db(&storage).await?;
+        println!("Final cleanup complete");
         Ok(())
     }
 }
