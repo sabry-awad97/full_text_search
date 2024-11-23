@@ -343,4 +343,80 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_fuzzy_search() -> Result<()> {
+        let dir = tempdir()?;
+        let index = OptimizedIndex::new(dir.path().to_path_buf())?;
+
+        // Add test documents
+        index
+            .add_document(
+                "Rust Programming Guide",
+                "Learn the fundamentals of Rust programming",
+            )
+            .await?;
+        index
+            .add_document("Python Development", "Python development best practices")
+            .await?;
+
+        // Test with fuzzy search enabled
+        let fuzzy_options = SearchOptions {
+            phrase_slop: None,
+            fuzzy_distance: Some(1), // Allow 1 character difference
+            boost_title: true,
+        };
+
+        // Test misspelling
+        let results = index.advanced_search("Ruts", fuzzy_options.clone()).await?;
+        assert_eq!(
+            results.len(),
+            1,
+            "Should match 'Rust' with one character difference"
+        );
+
+        // Test partial word
+        let results = index
+            .advanced_search("program", fuzzy_options.clone())
+            .await?;
+        assert_eq!(
+            results.len(),
+            1,
+            "Should match 'programming' as it starts with 'program'"
+        );
+
+        // Test with higher fuzzy distance
+        let fuzzy_options_2 = SearchOptions {
+            phrase_slop: None,
+            fuzzy_distance: Some(2), // Allow 2 character differences
+            boost_title: true,
+        };
+
+        // Test more significant misspelling
+        let results = index
+            .advanced_search("Pithon", fuzzy_options_2.clone())
+            .await?;
+        assert_eq!(
+            results.len(),
+            1,
+            "Should match 'Python' with two character differences"
+        );
+
+        // Test with fuzzy search disabled
+        let exact_options = SearchOptions {
+            phrase_slop: None,
+            fuzzy_distance: None,
+            boost_title: true,
+        };
+
+        // Verify misspelling doesn't match without fuzzy search
+        let results = index.advanced_search("Ruts", exact_options).await?;
+        assert_eq!(
+            results.len(),
+            0,
+            "Should not match 'Rust' when fuzzy search is disabled"
+        );
+
+        Ok(())
+    }
 }
