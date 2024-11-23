@@ -439,10 +439,7 @@ mod tests {
             )
             .await?;
         index
-            .add_document(
-                "Basic Programming",
-                "Introduction to programming concepts",
-            )
+            .add_document("Basic Programming", "Introduction to programming concepts")
             .await?;
 
         let fuzzy_options = SearchOptions {
@@ -536,9 +533,7 @@ mod tests {
 
         // Test no match with significant misspelling
         println!("\nTesting no match with significant misspelling...");
-        let results = index
-            .advanced_search("Rastafari", strict_options)
-            .await?;
+        let results = index.advanced_search("Rastafari", strict_options).await?;
         println!("Results for 'Rastafari': {:?}", results);
         assert_eq!(
             results.len(),

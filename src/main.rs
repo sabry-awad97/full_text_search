@@ -15,9 +15,14 @@ async fn main() -> Result<()> {
     // Get database URL from environment
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
+    let path = PathBuf::from("./search_index");
+    if !path.exists() {
+        std::fs::create_dir_all(&path)?;
+    }
+
     // Create storage and index
     let storage = PostgresStorage::new(&database_url).await?;
-    let index = OptimizedIndex::new(PathBuf::from("./search_index"))?;
+    let index = OptimizedIndex::new(path)?;
 
     // Create search engine
     let search_engine = Arc::new(SearchEngine::new(storage, index));
