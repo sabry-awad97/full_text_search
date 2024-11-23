@@ -61,10 +61,17 @@ async fn main() -> Result<()> {
     println!("Added document with ID: {}", doc2_id);
 
     // Search for documents
-    let results = search_engine_clone.search("rust").await?;
-    println!("\nSearch results for 'rust':");
-    for doc in results {
-        println!("Found document: {} (ID: {})", doc.title, doc.id);
+    let results = search_engine_clone.search("Rust").await?;
+    println!("\nSearch results for 'Rust':");
+    if results.is_empty() {
+        println!("No documents found.");
+    } else {
+        for doc in results {
+            println!("Title: {}", doc.title);
+            println!("ID: {}", doc.id);
+            println!("Content: {}", doc.body);
+            println!("-------------------");
+        }
     }
 
     Ok(())
