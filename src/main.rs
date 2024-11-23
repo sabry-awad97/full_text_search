@@ -1,9 +1,10 @@
 use anyhow::Result;
 use dotenvy::dotenv;
-use full_text_search::search::tantivy_index::TantivyIndex;
+use full_text_search::search::OptimizedIndex;
 use full_text_search::storage::postgres::PostgresStorage;
 use full_text_search::{DocumentEvent, SearchEngine};
 use futures::StreamExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -16,7 +17,7 @@ async fn main() -> Result<()> {
 
     // Create storage and index
     let storage = PostgresStorage::new(&database_url).await?;
-    let index = TantivyIndex::new()?;
+    let index = OptimizedIndex::new(PathBuf::from("./search_index"))?;
 
     // Create search engine
     let search_engine = Arc::new(SearchEngine::new(storage, index));
@@ -49,23 +50,17 @@ async fn main() -> Result<()> {
     let doc2_id = search_engine
         .add_document(
             "Document Management",
-            "This is a document about managing documents",
+            "Learn how to manage documents efficiently",
         )
         .await?;
     println!("Added document with ID: {}", doc2_id);
 
     // Search for documents
     let results = search_engine_clone.search("rust").await?;
+    println!("\nSearch results for 'rust':");
     for doc in results {
         println!("Found document: {} (ID: {})", doc.title, doc.id);
     }
 
-    let results = search_engine_clone.search("document").await?;
-    for doc in results {
-        println!("Found document: {} (ID: {})", doc.title, doc.id);
-    }
-
-    println!("Press Ctrl+C to exit");
-    tokio::signal::ctrl_c().await?;
     Ok(())
 }

@@ -10,3 +10,6 @@ pub trait SearchIndex: Clone + Send + Sync + 'static {
 
 pub mod memory;
 pub mod tantivy_index;
+pub mod optimized_index;
+
+pub use optimized_index::OptimizedIndex;

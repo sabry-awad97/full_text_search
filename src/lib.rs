@@ -60,10 +60,12 @@ impl<S: DocumentStorage, I: SearchIndex> SearchEngine<S, I> {
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<SearchDocument>> {
-        let results = self.index.search(query).await?;
-        let mut documents = Vec::new();
+        // First search in the index to get document IDs with scores
+        let search_results = self.index.search(query).await?;
 
-        for (id, _score) in results {
+        // Then fetch the actual documents from storage
+        let mut documents = Vec::new();
+        for (id, _score) in search_results {
             if let Ok(doc) = self.storage.get_document(id).await {
                 documents.push(doc);
             }
