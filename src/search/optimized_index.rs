@@ -419,4 +419,133 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_advanced_fuzzy_search() -> Result<()> {
+        let dir = tempdir()?;
+        let index = OptimizedIndex::new(dir.path().to_path_buf())?;
+
+        // Add test documents with various text patterns
+        index
+            .add_document(
+                "Rust & JavaScript Programming",
+                "Advanced Rust-JS integration guide",
+            )
+            .await?;
+        index
+            .add_document(
+                "Python Data Analysis",
+                "Data science with Panda's framework",
+            )
+            .await?;
+        index
+            .add_document(
+                "Basic Programming",
+                "Introduction to programming concepts",
+            )
+            .await?;
+
+        let fuzzy_options = SearchOptions {
+            phrase_slop: None,
+            fuzzy_distance: Some(2),
+            boost_title: true,
+        };
+
+        // Test multiple word fuzzy matches
+        println!("\nTesting multiple word fuzzy matches...");
+        let results = index
+            .advanced_search("Rast and Javasscript", fuzzy_options.clone())
+            .await?;
+        println!("Results for 'Rast and Javasscript': {:?}", results);
+        assert!(
+            results.iter().any(|(_, score)| *score > 1.0),
+            "Should have at least one high-scoring match for fuzzy multi-word query"
+        );
+
+        // Test mixed exact and fuzzy matches
+        println!("\nTesting mixed exact and fuzzy matches...");
+        let results = index
+            .advanced_search("Rust Javasscript", fuzzy_options.clone())
+            .await?;
+        println!("Results for 'Rust Javasscript': {:?}", results);
+        assert!(
+            results.iter().any(|(_, score)| *score > 1.5),
+            "Should have a high-scoring match for mixed exact/fuzzy query"
+        );
+
+        // Test fuzzy matches with special characters
+        println!("\nTesting fuzzy matches with special characters...");
+        let results = index
+            .advanced_search("RustJS", fuzzy_options.clone())
+            .await?;
+        println!("Results for 'RustJS': {:?}", results);
+        assert!(
+            results.iter().any(|(_, score)| *score > 0.5),
+            "Should match 'Rust-JS' despite special characters"
+        );
+
+        // Test case sensitivity with fuzzy search
+        println!("\nTesting case sensitivity...");
+        let results = index
+            .advanced_search("RAST AND JAVAscript", fuzzy_options.clone())
+            .await?;
+        println!("Results for 'RAST AND JAVAscript': {:?}", results);
+        assert!(
+            results.iter().any(|(_, score)| *score > 1.0),
+            "Should match regardless of case differences"
+        );
+
+        // Test fuzzy matching in title vs body
+        println!("\nTesting fuzzy matching in body...");
+        let results = index
+            .advanced_search("Panda framework", fuzzy_options.clone())
+            .await?;
+        println!("Results for 'Panda framework': {:?}", results);
+        assert!(
+            results.iter().any(|(_, score)| *score > 0.5),
+            "Should match content in body with apostrophe"
+        );
+
+        // Test fuzzy prefix matching
+        println!("\nTesting fuzzy prefix matching...");
+        let results = index
+            .advanced_search("progra", fuzzy_options.clone())
+            .await?;
+        println!("Results for 'progra': {:?}", results);
+        assert!(
+            results.len() >= 2,
+            "Should match multiple documents with 'programming' prefix"
+        );
+
+        // Test with very strict fuzzy distance
+        let strict_options = SearchOptions {
+            phrase_slop: None,
+            fuzzy_distance: Some(1),
+            boost_title: true,
+        };
+
+        println!("\nTesting with strict fuzzy distance...");
+        let results = index
+            .advanced_search("Rast", strict_options.clone())
+            .await?;
+        println!("Results for 'Rast' with strict distance: {:?}", results);
+        assert!(
+            results.iter().any(|(_, score)| *score > 0.5),
+            "Should still match with stricter fuzzy distance"
+        );
+
+        // Test no match with significant misspelling
+        println!("\nTesting no match with significant misspelling...");
+        let results = index
+            .advanced_search("Rastafari", strict_options)
+            .await?;
+        println!("Results for 'Rastafari': {:?}", results);
+        assert_eq!(
+            results.len(),
+            0,
+            "Should not match with too many character differences"
+        );
+
+        Ok(())
+    }
 }
